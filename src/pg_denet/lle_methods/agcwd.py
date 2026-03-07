@@ -33,7 +33,7 @@ def _set_value_channel(image: np.ndarray, v_channel: np.ndarray) -> np.ndarray:
 
 
 def _build_lut(v_channel: np.ndarray, w: float) -> np.ndarray:
-    """建立 256 entry 的 Gamma LUT（論文 Eq. 6–7）。"""
+    """建立 256 entry 的 Gamma LUT (論文 Eq. 6-7)。"""
     hist = cv2.calcHist([v_channel], [0], None, [256], [0, 256]).flatten()
     pdf = hist / hist.sum()
 
@@ -46,16 +46,16 @@ def _build_lut(v_channel: np.ndarray, w: float) -> np.ndarray:
     return np.clip(lut, 0, 255).astype(np.uint8)
 
 
-def apply_agcwd(image: np.ndarray, w: float = 0.5) -> np.ndarray:
+def apply_agcwd(image: np.ndarray, w: float = 0.8) -> np.ndarray:
     """以 AGCWD 演算法增強低光影像。
 
     Args:
-        image: 輸入 BGR 圖片（uint8），可為彩色或灰階。
+        image: 輸入 BGR 圖片(uint8)，可為彩色或灰階。
         w:     PDF 加權指數，控制 Gamma 曲線的彎曲程度。
                w → 0 趨近線性，w → 1 接近傳統 AGCWD。
 
     Returns:
-        增強後的 BGR 圖片（uint8）。
+        增強後的 BGR 圖片(uint8)。
     """
     is_color = image.ndim == 3
     v = _extract_value_channel(image) if is_color else image

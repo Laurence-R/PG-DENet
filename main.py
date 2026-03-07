@@ -2,7 +2,7 @@ import time
 import cv2
 from pathlib import Path
 
-from pg_denet import load_images, retinex_decompose, show_images, apply_clahe, apply_lime, apply_agcwd
+from pg_denet import load_images, retinex_decompose, show_images, apply_clahe, apply_lime, apply_agcwd, apply_msrcr
 
 # --- 輸入來源 ---
 image_dir = Path("data/eval15/low")
@@ -28,6 +28,7 @@ def main():
         enhanced_clahe = timed("CLAHE",  apply_clahe, src)
         enhanced_lime  = timed("LIME",   apply_lime,  src)
         enhanced_agcwd = timed("AGCWD",  apply_agcwd, src)
+        enhanced_msrcr = timed("MSRCR",  apply_msrcr, src)
 
         # 3. 顯示結果
         show_images({
@@ -35,6 +36,7 @@ def main():
             "CLAHE":             enhanced_clahe,
             "LIME":              enhanced_lime,
             "AGCWD":             enhanced_agcwd,
+            "MSRCR":             enhanced_msrcr,
         }, window_title=file_path.name)
 
 
