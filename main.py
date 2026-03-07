@@ -2,7 +2,7 @@ import time
 import cv2
 from pathlib import Path
 
-from pg_denet import load_images, retinex_decompose, show_images, apply_clahe, apply_lime, apply_agcwd, apply_msrcr
+from pg_denet import load_images, retinex_decompose, show_images, save_images, apply_clahe, apply_lime, apply_agcwd, apply_msrcr
 
 # --- 輸入來源 ---
 image_dir = Path("data/eval15/low")
@@ -30,14 +30,16 @@ def main():
         enhanced_agcwd = timed("AGCWD",  apply_agcwd, src)
         enhanced_msrcr = timed("MSRCR",  apply_msrcr, src)
 
-        # 3. 顯示結果
-        show_images({
+        # 3. 顯示 & 儲存結果
+        grid_images = {
             "Source (S)":        src,
             "CLAHE":             enhanced_clahe,
             "LIME":              enhanced_lime,
             "AGCWD":             enhanced_agcwd,
             "MSRCR":             enhanced_msrcr,
-        }, window_title=file_path.name)
+        }
+        # show_images(grid_images, window_title=file_path.name)
+        save_images(grid_images, filename=file_path.name)
 
 
 if __name__ == "__main__":
