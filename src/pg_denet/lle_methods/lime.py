@@ -103,24 +103,27 @@ def apply_lime(
     gamma: float = 0.6,
     epsilon: float = 1e-3,
 ) -> np.ndarray:
-    """Enhance a low-light BGR image using the LIME algorithm.
+    """Enhance a float32 linear-space BGR image using the LIME algorithm.
 
     Args:
-        image:   Input BGR image (uint8, H×W×3).
+        image:   Input float32 BGR 影像（線性空間，值可 > 1.0）。
         alpha:   Regularisation strength for illumination smoothing.
-                 Larger → smoother T, less texture leakage.  (paper default: 0.15)
         gamma:   Gamma value for illumination correction.
-                 Smaller → brighter output.  (paper default: 0.6 or tuned per-image)
         epsilon: Small constant preventing division-by-zero in weight computation.
 
     Returns:
-        Enhanced BGR image (uint8, H×W×3).
+        Enhanced float32 BGR 影像（線性空間）。
     """
-    # --- Normalise to [0, 1] float32 ------------------------------------
-    S = image.astype(np.float32) / 255.0
+    S = image.astype(np.float32)
+    S_max = S.max()
+    if S_max < 1e-7:
+        return S.copy()
+
+    # 正規化至 [0, 1] 做照明估計
+    S_norm = S / S_max
 
     # --- Step 1: Initial illumination map --------------------------------
-    T_hat = _initial_illumination(S)                    # (H, W)
+    T_hat = _initial_illumination(S_norm)               # (H, W)
 
     # --- Step 2: Compute spatial weights ---------------------------------
     W_h, W_v = _gradient_weights(T_hat, epsilon)
@@ -132,7 +135,8 @@ def apply_lime(
     T_gamma = np.power(T, gamma)                        # (H, W)
 
     # --- Step 5: Enhance each channel  R_c = S_c / T_γ ------------------
-    T_gamma_3ch = np.stack([T_gamma] * 3, axis=2)      # broadcast to (H, W, 3)
-    enhanced = np.clip(S / (T_gamma_3ch + 1e-7), 0.0, 1.0)
+    T_gamma_3ch = T_gamma[:, :, np.newaxis]             # (H, W, 1)
+    enhanced = S_norm / (T_gamma_3ch + 1e-7)
 
-    return (enhanced * 255.0).astype(np.uint8)
+    # 還原回原始 HDR 範圍
+    return (enhanced * S_max).astype(np.float32)

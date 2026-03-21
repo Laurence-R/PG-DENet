@@ -63,22 +63,20 @@ def apply_msrcr(
     G: float = 5.0,
     b: float = 25.0,
 ) -> np.ndarray:
-    """Enhance a low-light BGR image using MSRCR.
+    """Enhance a float32 linear-space BGR image using MSRCR.
 
     Args:
-        image:   Input BGR image (uint8, H×W×3).
+        image:   Input float32 BGR image（線性空間，值可 > 1.0）。
         sigmas:  Gaussian scales for each SSR pass (paper default: 15, 80, 250).
         alpha:   Nonlinearity strength in the Color Restoration Function.
-                 Larger → stronger colour boost.  (paper default: 125)
-        beta:    Gain of the Color Restoration Function.  (paper default: 46)
-        G:       Global gain applied after CRF × MSR.    (paper default: 192)
-        b:       Global offset (bias).                   (paper default: -30)
+        beta:    Gain of the Color Restoration Function.
+        G:       Global gain applied after CRF × MSR.
+        b:       Global offset (bias).
 
     Returns:
-        Enhanced BGR image (uint8, H×W×3).
+        Enhanced float32 BGR image（線性空間）。
     """
-
-    img = image.astype(np.float32) + 1.0    # +1 to keep pixel values > 0
+    img = image.astype(np.float32) + 1e-6   # avoid log(0)
 
     # ── Step 1 & 2: Weighted Multi-Scale Retinex per channel ─────────────────
     msr = _multi_scale_retinex(img, sigmas)
@@ -86,14 +84,19 @@ def apply_msrcr(
     # ── Step 3: Color Restoration Function ───────────────────────────────────
     crf = _color_restoration(img, alpha, beta)
 
-    # ── Step 4: MSRCR = G * CRF * MSR + b, then normalise ───────────────────
+    # ── Step 4: MSRCR = G * CRF * MSR + b ───────────────────────────────────
     msrcr = G * crf * msr + b
 
-    # Per-channel simple scale normalisation to [0, 255]
-    out = np.empty_like(msrcr, dtype=np.uint8)
+    # Per-channel normalisation to [0, max_of_input] — preserve HDR float32
+    out = np.empty_like(msrcr, dtype=np.float32)
     for c in range(3):
         ch = msrcr[:, :, c]
-        ch = cv2.normalize(ch, None, 0, 255, cv2.NORM_MINMAX)
-        out[:, :, c] = np.clip(ch, 0, 255).astype(np.uint8)
+        c_min, c_max = ch.min(), ch.max()
+        if c_max - c_min > 1e-7:
+            out[:, :, c] = (ch - c_min) / (c_max - c_min)
+        else:
+            out[:, :, c] = 0.0
 
-    return out
+    # Scale to match input's dynamic range
+    out *= image.max()
+    return np.maximum(out, 0.0).astype(np.float32)
