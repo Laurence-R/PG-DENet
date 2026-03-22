@@ -1,4 +1,4 @@
-"""MSRCR: Multi-Scale Retinex with Color Restoration.
+"""MSRCR: Multi-Scale Retinex with Color Restoration (GPU-accelerated).
 
 References:
     Rahman, Z., Jobson, D. J., & Woodell, G. A. (1996).
@@ -20,39 +20,16 @@ Algorithm:
     3. Color Restoration Function (CRF):
            C_c(x) = β · [log(α · I_c(x)) − log(Σ_c I_c(x))]
 
-       CRF compensates for the colour distortion introduced by MSR when the
-       scene illumination is not neutral.
-
     4. Final output:
            MSRCR_c(x) = G · C_c(x) · R_c(x) + b
 
-       then normalise each channel to [0, 255].
+       then normalise each channel to [0, 1] and scale back to input range.
 """
 
-import cv2
 import numpy as np
+import torch
 
-
-def _single_scale_retinex(channel: np.ndarray, sigma: float) -> np.ndarray:
-    """Compute SSR for one channel (float32 input, log-domain output)."""
-    blur = cv2.GaussianBlur(channel, (0, 0), sigma)
-    ssr = np.log1p(channel) - np.log1p(blur)   # log1p avoids log(0)
-    return ssr
-
-def _multi_scale_retinex(image: np.ndarray, sigmas: list) -> np.ndarray:
-    """Compute MSR for whole image"""
-    retinex = np.zeros_like(image)
-    for sigma in sigmas:
-        for c in range(3):
-            retinex[:, :, c] += _single_scale_retinex(image[:, :, c], sigma)
-    
-    msr = retinex/len(sigmas)
-    return msr
-
-def _color_restoration(image: np.ndarray, alpha: float, beta: float) -> np.ndarray:
-    img_sum = image.sum(axis=2, keepdims=True) + 1e-6     # Σ_c I_c, avoid /0
-    crf = beta * (np.log(alpha * image + 1e-6) - np.log(img_sum))
-    return crf
+from pg_denet.gpu import gaussian_blur_fft, to_gpu, to_cpu
 
 
 def apply_msrcr(
@@ -65,6 +42,8 @@ def apply_msrcr(
 ) -> np.ndarray:
     """Enhance a float32 linear-space BGR image using MSRCR.
 
+    All heavy operations (FFT Gaussian blur, log, normalisation) run on GPU.
+
     Args:
         image:   Input float32 BGR image（線性空間，值可 > 1.0）。
         sigmas:  Gaussian scales for each SSR pass (paper default: 15, 80, 250).
@@ -76,27 +55,34 @@ def apply_msrcr(
     Returns:
         Enhanced float32 BGR image（線性空間）。
     """
-    img = image.astype(np.float32) + 1e-6   # avoid log(0)
+    img_t = to_gpu(image) + 1e-6  # (H, W, 3) avoid log(0)
+    img_max = img_t.max()
 
-    # ── Step 1 & 2: Weighted Multi-Scale Retinex per channel ─────────────────
-    msr = _multi_scale_retinex(img, sigmas)
+    # ── Step 1 & 2: Multi-Scale Retinex (FFT blur on GPU) ───────────────
+    retinex = torch.zeros_like(img_t)
+    log_img = torch.log1p(img_t)
+    for sigma in sigmas:
+        for c in range(3):
+            blur_c = gaussian_blur_fft(img_t[:, :, c], sigma)
+            retinex[:, :, c] += log_img[:, :, c] - torch.log1p(blur_c)
+    msr = retinex / len(sigmas)
 
-    # ── Step 3: Color Restoration Function ───────────────────────────────────
-    crf = _color_restoration(img, alpha, beta)
+    # ── Step 3: Color Restoration Function ───────────────────────────────
+    img_sum = img_t.sum(dim=2, keepdim=True) + 1e-6
+    crf = beta * (torch.log(alpha * img_t + 1e-6) - torch.log(img_sum))
 
-    # ── Step 4: MSRCR = G * CRF * MSR + b ───────────────────────────────────
+    # ── Step 4: MSRCR = G * CRF * MSR + b ───────────────────────────────
     msrcr = G * crf * msr + b
 
-    # Per-channel normalisation to [0, max_of_input] — preserve HDR float32
-    out = np.empty_like(msrcr, dtype=np.float32)
+    # Per-channel normalisation to [0, 1] then scale to input range
     for c in range(3):
         ch = msrcr[:, :, c]
-        c_min, c_max = ch.min(), ch.max()
-        if c_max - c_min > 1e-7:
-            out[:, :, c] = (ch - c_min) / (c_max - c_min)
+        c_min = ch.min()
+        c_max = ch.max()
+        if (c_max - c_min) > 1e-7:
+            msrcr[:, :, c] = (ch - c_min) / (c_max - c_min)
         else:
-            out[:, :, c] = 0.0
+            msrcr[:, :, c] = 0.0
 
-    # Scale to match input's dynamic range
-    out *= image.max()
-    return np.maximum(out, 0.0).astype(np.float32)
+    result = torch.clamp(msrcr * img_max, min=0.0)
+    return to_cpu(result)

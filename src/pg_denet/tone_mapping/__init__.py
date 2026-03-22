@@ -1,4 +1,4 @@
-"""Global Tone Mapping operators for HDR → LDR conversion.
+"""Global Tone Mapping operators for HDR → LDR conversion (GPU-accelerated).
 
 All operators expect **float32 BGR images in linear space** (auto-exposed)
 and return **uint8 BGR images** suitable for display.
@@ -9,17 +9,18 @@ References:
     - Reinhard: Reinhard et al. (2002), Photographic tone reproduction.
 """
 
+import math
+
 import numpy as np
+import torch
+
+from pg_denet.gpu import to_gpu
 
 
-def _luminance(bgr: np.ndarray) -> np.ndarray:
-    """Rec. 709 luminance from BGR."""
-    return 0.0722 * bgr[:, :, 0] + 0.7152 * bgr[:, :, 1] + 0.2126 * bgr[:, :, 2]
-
-
-def _apply_gamma(img: np.ndarray, gamma: float = 2.2) -> np.ndarray:
-    """Gamma-correct and convert to uint8."""
-    return (np.clip(img, 0.0, 1.0) ** (1.0 / gamma) * 255).astype(np.uint8)
+def _apply_gamma_gpu(img: torch.Tensor, gamma: float = 2.2) -> np.ndarray:
+    """Gamma-correct on GPU and return uint8 numpy array."""
+    out = torch.clamp(img, 0.0, 1.0).pow(1.0 / gamma).mul(255.0)
+    return out.to(torch.uint8).cpu().numpy()
 
 
 # ── Logarithmic ──────────────────────────────────────────────────────────────
@@ -29,9 +30,9 @@ def tone_map_logarithmic(
     mu: float = 100.0,
     gamma: float = 2.2,
 ) -> np.ndarray:
-    """Logarithmic global tone mapping.
+    """Logarithmic global tone mapping (per-channel, GPU).
 
-    .. math:: L_{out} = \\frac{\\log(1 + \\mu \\, L)}{\\log(1 + \\mu)}
+    .. math:: C_{out} = \\frac{\\log(1 + \\mu \\cdot C / C_{\\max})}{\\log(1 + \\mu)}
 
     Args:
         hdr_bgr: Auto-exposed linear float32 BGR image.
@@ -41,11 +42,13 @@ def tone_map_logarithmic(
     Returns:
         uint8 BGR image.
     """
-    L = _luminance(hdr_bgr)
-    L_mapped = np.log(1.0 + mu * L) / np.log(1.0 + mu)
-    scale = L_mapped / (L + 1e-7)
-    result = hdr_bgr * scale[:, :, np.newaxis]
-    return _apply_gamma(result, gamma)
+    img = torch.clamp(to_gpu(hdr_bgr), min=0.0)
+    img_max = img.max()
+    if img_max > 0:
+        result = torch.log1p(mu * img / img_max) / math.log(1.0 + mu)
+    else:
+        result = torch.zeros_like(img)
+    return _apply_gamma_gpu(result, gamma)
 
 
 # ── Linear ────────────────────────────────────────────────────────────────────
@@ -54,9 +57,9 @@ def tone_map_linear(
     hdr_bgr: np.ndarray,
     gamma: float = 2.2,
 ) -> np.ndarray:
-    """Linear global tone mapping (max-normalization).
+    """Linear global tone mapping (per-channel max normalization, GPU).
 
-    .. math:: L_{out} = L / \\max(L)
+    .. math:: C_{out} = C / \\max(C_{all})
 
     Args:
         hdr_bgr: Auto-exposed linear float32 BGR image.
@@ -65,10 +68,10 @@ def tone_map_linear(
     Returns:
         uint8 BGR image.
     """
-    L = _luminance(hdr_bgr)
-    L_max = L.max()
-    result = hdr_bgr / L_max if L_max > 0 else hdr_bgr.copy()
-    return _apply_gamma(result, gamma)
+    img = to_gpu(hdr_bgr)
+    img_max = img.max()
+    result = img / img_max if img_max > 0 else img.clone()
+    return _apply_gamma_gpu(result, gamma)
 
 
 # ── Reinhard ──────────────────────────────────────────────────────────────────
@@ -77,9 +80,9 @@ def tone_map_reinhard(
     hdr_bgr: np.ndarray,
     gamma: float = 2.2,
 ) -> np.ndarray:
-    """Reinhard global tone mapping.
+    """Reinhard global tone mapping (per-channel, GPU).
 
-    .. math:: L_{out} = \\frac{L}{1 + L}
+    .. math:: C_{out} = \\frac{C}{1 + C}
 
     Args:
         hdr_bgr: Auto-exposed linear float32 BGR image.
@@ -88,8 +91,6 @@ def tone_map_reinhard(
     Returns:
         uint8 BGR image.
     """
-    L = _luminance(hdr_bgr)
-    L_mapped = L / (1.0 + L)
-    scale = L_mapped / (L + 1e-7)
-    result = hdr_bgr * scale[:, :, np.newaxis]
-    return _apply_gamma(result, gamma)
+    img = torch.clamp(to_gpu(hdr_bgr), min=0.0)
+    result = img / (1.0 + img)
+    return _apply_gamma_gpu(result, gamma)

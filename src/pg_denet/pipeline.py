@@ -7,15 +7,15 @@ metrics across images / TM methods for chart generation.
 
 from __future__ import annotations
 
+import gc
 from collections import OrderedDict
 from pathlib import Path
 
+import cv2
 import numpy as np
-
 from pg_denet.pre_processing import auto_expose, resize_max
 from pg_denet.detection import detect, build_pseudo_gt, compute_perception_metrics
 from pg_denet.metrics import compute_niqe, compute_eme, compute_brisque
-from pg_denet.visualization import save_images
 from pg_denet.utils import timed, print_table
 
 
@@ -26,16 +26,19 @@ def process_one_image(
     lle_methods: OrderedDict,
     tm_methods: OrderedDict,
     max_side: int = 1024,
+    save_dir: Path | None = None,
 ) -> None:
     """Run the full pipeline on a single HDR image.
 
     Args:
         path:           Source file path (used for naming output files).
         hdr_linear:     Raw float32 linear BGR image.
-        per_tm_metrics: Accumulator ``{tm: {lle: {"perc": [...], "iq": [...]}}}``.
+        per_tm_metrics: Accumulator ``{tm: {lle: {"perc": [...], "iq": [...]}}}}``.
         lle_methods:    ``OrderedDict[name, fn]`` of LLE enhancement functions.
         tm_methods:     ``OrderedDict[name, fn]`` of Tone Mapping functions.
         max_side:       Resize longest side to this value.
+        save_dir:       If given, save each LDR result image under
+                        ``{save_dir}/{stem}/{tm_name}/{lle_name}.png``.
     """
     stem = path.stem
     print(f"\n{'=' * 64}")
@@ -52,6 +55,7 @@ def process_one_image(
     lle_results: OrderedDict[str, np.ndarray] = OrderedDict()
     for lle_name, lle_fn in lle_methods.items():
         lle_results[lle_name] = timed(lle_name, lle_fn, hdr_exposed)
+    del hdr_exposed  # no longer needed after LLE
 
     # ── 3 & 4. TM → LDR → Metrics (per TM category) ─────────────────────
     for tm_name, tm_fn in tm_methods.items():
@@ -62,6 +66,13 @@ def process_one_image(
         tm_results: OrderedDict[str, np.ndarray] = OrderedDict()
         for lle_name, enhanced in lle_results.items():
             tm_results[lle_name] = timed(f"{lle_name}→{tm_name}", tm_fn, enhanced)
+
+        # ── Save recovered LDR images (optional) ─────────────────────
+        if save_dir is not None:
+            for lle_name, img in tm_results.items():
+                out_path = save_dir / path.stem / tm_name / f"{lle_name}.png"
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(out_path), img)
 
         # ── YOLO Detection ────────────────────────────────────────────
         print("\n  [YOLO Detection]")
@@ -108,21 +119,16 @@ def process_one_image(
             iq_rows,
         )
 
-        # ── Save image grids ─────────────────────────────────────────
-        out_dir = Path(f"result/{tm_name}")
-        save_images(tm_results, filename=f"{stem}.png", output_dir=out_dir)
-
-        det_grid: OrderedDict[str, np.ndarray] = OrderedDict()
-        for name in tm_results:
-            det_grid[name] = detections[name]["annotated"]
-        save_images(det_grid, filename=f"{stem}_yolo.png", output_dir=out_dir)
-
-        print(f"\n  ✓ result/{tm_name}/{stem}*.png")
-
         # Accumulate metrics
         for lle_name in perc_data:
             per_tm_metrics[tm_name][lle_name]["perc"].append(perc_data[lle_name])
             per_tm_metrics[tm_name][lle_name]["iq"].append(iq_data[lle_name])
+
+        del tm_results, detections
+        gc.collect()
+
+    del lle_results
+    gc.collect()
 
 
 def build_combined_avg(

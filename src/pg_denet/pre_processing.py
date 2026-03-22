@@ -1,4 +1,4 @@
-"""Pre-processing utilities for the HDR image pipeline.
+"""Pre-processing utilities for the HDR image pipeline (GPU-accelerated).
 
 Handles exposure normalization. No conversion to LDR here — that is the
 job of the Tone Mapping stage.
@@ -6,10 +6,15 @@ job of the Tone Mapping stage.
 
 import cv2
 import numpy as np
+import torch
+
+from pg_denet.gpu import luminance_gpu, to_gpu, to_cpu
 
 
 def auto_expose(linear_bgr: np.ndarray, key: float = 0.18) -> np.ndarray:
     """Reinhard-style auto-exposure: maps log-average luminance to *key* value.
+
+    GPU-accelerated: the log-average and scaling run on CUDA.
 
     Args:
         linear_bgr: Linear-space float32 BGR image.
@@ -18,10 +23,11 @@ def auto_expose(linear_bgr: np.ndarray, key: float = 0.18) -> np.ndarray:
     Returns:
         Exposed float32 BGR image (values may exceed 1.0).
     """
-    L = 0.0722 * linear_bgr[:, :, 0] + 0.7152 * linear_bgr[:, :, 1] + 0.2126 * linear_bgr[:, :, 2]
-    L_avg = np.exp(np.mean(np.log(L + 1e-7)))
+    img_t = to_gpu(linear_bgr)
+    L = luminance_gpu(img_t)
+    L_avg = torch.exp(torch.mean(torch.log(L + 1e-7)))
     scale = key / (L_avg + 1e-7)
-    return (linear_bgr * scale).astype(np.float32)
+    return to_cpu(img_t * scale)
 
 
 def resize_max(image: np.ndarray, max_side: int = 1024) -> np.ndarray:

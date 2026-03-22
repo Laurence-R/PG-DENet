@@ -1,4 +1,4 @@
-"""AGCWD: Adaptive Gamma Correction with Weighting Distribution.
+"""AGCWD: Adaptive Gamma Correction with Weighting Distribution (GPU-accelerated).
 
 Reference:
     Huang, S.-C., Cheng, F.-C., & Chiu, Y.-S. (2013).
@@ -14,14 +14,16 @@ Algorithm overview:
     5. 內插回連續亮度值，以亮度比例調整各通道
 """
 
-import cv2
 import numpy as np
+import torch
+
+from pg_denet.gpu import luminance_gpu, to_gpu, to_cpu
 
 N_BINS = 4096  # 高精度直方圖 bin 數量
 
 
 def apply_agcwd(image: np.ndarray, w: float = 0.8) -> np.ndarray:
-    """以 AGCWD 演算法增強 float32 線性空間影像。
+    """以 AGCWD 演算法增強 float32 線性空間影像 (GPU)。
 
     Args:
         image: 輸入 float32 BGR 影像（線性空間，值可 > 1.0）。
@@ -30,31 +32,31 @@ def apply_agcwd(image: np.ndarray, w: float = 0.8) -> np.ndarray:
     Returns:
         增強後的 float32 BGR 影像（線性空間）。
     """
-    # 亮度通道
-    L = 0.0722 * image[:, :, 0] + 0.7152 * image[:, :, 1] + 0.2126 * image[:, :, 2]
-    L = np.maximum(L, 1e-7)
-    L_max = L.max()
+    img_t = to_gpu(image)  # (H, W, 3)
 
-    # 正規化至 [0, 1] 做直方圖
-    L_norm = L / L_max
+    # 亮度通道
+    L_t = torch.clamp(luminance_gpu(img_t), min=1e-7)
+    L_max = L_t.max()
+    L_norm = L_t / L_max
 
     # 量化成 N_BINS 個 bin
-    L_idx = np.clip((L_norm * (N_BINS - 1)).astype(np.int32), 0, N_BINS - 1)
-    hist = np.bincount(L_idx.ravel(), minlength=N_BINS).astype(np.float64)
+    L_idx = torch.clamp((L_norm * (N_BINS - 1)).to(torch.int64), 0, N_BINS - 1)
+    hist = torch.bincount(L_idx.flatten(), minlength=N_BINS).float()
     pdf = hist / hist.sum()
 
-    pdf_min, pdf_max = pdf.min(), pdf.max()
+    pdf_min = pdf.min()
+    pdf_max = pdf.max()
     w_pdf = pdf_max * ((pdf - pdf_min) / (pdf_max - pdf_min + 1e-7)) ** w
-    cdf = np.cumsum(w_pdf) / (w_pdf.sum() + 1e-7)
+    cdf = torch.cumsum(w_pdf, dim=0) / (w_pdf.sum() + 1e-7)
 
-    # 建立 bin 中心值
-    levels = np.arange(N_BINS, dtype=np.float64) / (N_BINS - 1)
-    # Gamma 校正: T(l) = l ^ (1 - cdf(l))
-    mapped = np.power(levels, 1.0 - cdf)
+    # 建立 bin 中心值 + Gamma 校正: T(l) = l ^ (1 - cdf(l))
+    levels = torch.arange(N_BINS, device=img_t.device, dtype=torch.float32) / (N_BINS - 1)
+    mapped = torch.pow(levels, 1.0 - cdf)
 
-    # 用 LUT 查表，再乘回 L_max
-    L_enhanced = mapped[L_idx].astype(np.float32) * L_max
+    # LUT 查表，乘回 L_max
+    L_enhanced = mapped[L_idx] * L_max
 
     # 以亮度比例調整各通道
-    ratio = (L_enhanced / L)[:, :, np.newaxis]
-    return (image * ratio).astype(np.float32)
+    ratio = (L_enhanced / L_t).unsqueeze(2)
+    result = img_t * ratio
+    return to_cpu(result)

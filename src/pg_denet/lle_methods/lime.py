@@ -1,4 +1,4 @@
-"""LIME: Low-light IMage Enhancement via Illumination Map Estimation.
+"""LIME: Low-light IMage Enhancement via Illumination Map Estimation (GPU-accelerated).
 
 Reference:
     Guo, X., Li, Y., & Ling, H. (2017).
@@ -13,84 +13,79 @@ Algorithm overview (Fig. 1 of the paper):
          W_h = 1 / (|∂_h T̂| + ε),  W_v = 1 / (|∂_v T̂| + ε)
     3. Gamma-correct the refined map:  T_γ = T ^ γ
     4. Recover the enhanced image:     R_c = S_c / T_γ  (per channel)
+
+GPU acceleration:
+    Instead of building a huge sparse matrix (N×N, N≈700 K) and calling
+    ``scipy.sparse.linalg.spsolve``, we use a **matrix-free Conjugate Gradient
+    (CG)** solver on CUDA.  Each CG iteration evaluates the operator
+    A·x = x + α·div(W·∇x) via simple element-wise + shift operations, which
+    map perfectly to GPU parallelism.
 """
 
-import cv2
 import numpy as np
-from scipy.sparse import diags, eye
-from scipy.sparse.linalg import spsolve
+import torch
+
+from pg_denet.gpu import device, to_gpu, to_cpu
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Internal helpers (GPU)
 # ---------------------------------------------------------------------------
 
-def _initial_illumination(image: np.ndarray) -> np.ndarray:
-    """Step 1 – T̂(x) = max_{c∈{R,G,B}} S_c(x).  Returns a (H,W) float32 map."""
-    return np.max(image, axis=2)
+def _apply_A(
+    t: torch.Tensor,
+    W_h: torch.Tensor,
+    W_v: torch.Tensor,
+    alpha: float,
+) -> torch.Tensor:
+    """Compute A·t = t + α·(Dh^T Wh Dh + Dv^T Wv Dv)·t  (matrix-free)."""
+    # Forward differences
+    dh = torch.zeros_like(t)
+    dh[:, :-1] = t[:, 1:] - t[:, :-1]
+    dv = torch.zeros_like(t)
+    dv[:-1, :] = t[1:, :] - t[:-1, :]
+
+    # Weighted
+    w_dh = W_h * dh
+    w_dv = W_v * dv
+
+    # Adjoint (backward divergence)
+    adj = torch.zeros_like(t)
+    adj -= w_dh
+    adj[:, 1:] += w_dh[:, :-1]
+    adj -= w_dv
+    adj[1:, :] += w_dv[:-1, :]
+
+    return t + alpha * adj
 
 
-def _gradient_weights(T_hat: np.ndarray, epsilon: float) -> tuple[np.ndarray, np.ndarray]:
-    """Compute structure-aware weights from the gradients of T̂.
+def _cg_solve(
+    b: torch.Tensor,
+    W_h: torch.Tensor,
+    W_v: torch.Tensor,
+    alpha: float,
+    tol: float = 1e-5,
+    max_iter: int = 300,
+) -> torch.Tensor:
+    """Conjugate Gradient solver for (I + α·L)·x = b on GPU."""
+    x = b.clone()
+    r = b - _apply_A(x, W_h, W_v, alpha)
+    p = r.clone()
+    rs_old = torch.dot(r.flatten(), r.flatten())
 
-    W_h(x) = 1 / (|∂_h T̂(x)| + ε)
-    W_v(x) = 1 / (|∂_v T̂(x)| + ε)
+    for _ in range(max_iter):
+        Ap = _apply_A(p, W_h, W_v, alpha)
+        pAp = torch.dot(p.flatten(), Ap.flatten())
+        alpha_cg = rs_old / (pAp + 1e-10)
+        x = x + alpha_cg * p
+        r = r - alpha_cg * Ap
+        rs_new = torch.dot(r.flatten(), r.flatten())
+        if rs_new.sqrt().item() < tol:
+            break
+        p = r + (rs_new / (rs_old + 1e-10)) * p
+        rs_old = rs_new
 
-    Forward differences with zero-padding at boundaries.
-    """
-    dh = np.diff(T_hat, axis=1, append=T_hat[:, -1:])   # (H, W)
-    dv = np.diff(T_hat, axis=0, append=T_hat[-1:, :])   # (H, W)
-    W_h = 1.0 / (np.abs(dh) + epsilon)
-    W_v = 1.0 / (np.abs(dv) + epsilon)
-    return W_h.astype(np.float32), W_v.astype(np.float32)
-
-
-def _build_diff_matrices(h: int, w: int):
-    """Build sparse N×N forward-difference matrices D_h and D_v (N = h*w).
-
-    D_h implements horizontal forward difference with Dirichlet BC at right edge.
-    D_v implements vertical   forward difference with Dirichlet BC at bottom edge.
-    """
-    n = h * w
-
-    # ---- horizontal: pixel k ↔ (i, j),  difference = T[i,j+1] - T[i,j] ----
-    mask_h = np.ones(n, dtype=np.float32)
-    mask_h[np.arange(w - 1, n, w)] = 0.0          # no right neighbour at col w-1
-    Dh = diags([-mask_h, mask_h[:-1]], [0, 1], shape=(n, n), format='csr')
-
-    # ---- vertical:   pixel k ↔ (i, j),  difference = T[i+1,j] - T[i,j] ----
-    mask_v = np.ones(n, dtype=np.float32)
-    mask_v[n - w:] = 0.0                           # no bottom neighbour at row h-1
-    Dv = diags([-mask_v, mask_v[:-w]], [0, w], shape=(n, n), format='csr')
-
-    return Dh, Dv
-
-
-def _refine_illumination(T_hat: np.ndarray,
-                         W_h: np.ndarray,
-                         W_v: np.ndarray,
-                         alpha: float) -> np.ndarray:
-    """Step 2 – Solve the weighted TV regularisation as a sparse linear system.
-
-    Approximating the L1 TV with L2 (fixed-weight linearisation) gives:
-
-        (I  +  α · (D_h^T W_h D_h  +  D_v^T W_v D_v)) · t  =  t̂
-
-    where W_h, W_v are diagonal matrices built from the spatial weight maps.
-    """
-    h, w = T_hat.shape
-    n = h * w
-
-    Dh, Dv = _build_diff_matrices(h, w)
-
-    Wh_diag = diags(W_h.flatten(), 0, format='csr')
-    Wv_diag = diags(W_v.flatten(), 0, format='csr')
-
-    A = eye(n, format='csr') + alpha * (Dh.T @ Wh_diag @ Dh + Dv.T @ Wv_diag @ Dv)
-    b = T_hat.flatten()
-
-    t = spsolve(A, b)
-    return np.clip(t, 0.0, 1.0).reshape(h, w).astype(np.float32)
+    return x
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +98,7 @@ def apply_lime(
     gamma: float = 0.6,
     epsilon: float = 1e-3,
 ) -> np.ndarray:
-    """Enhance a float32 linear-space BGR image using the LIME algorithm.
+    """Enhance a float32 linear-space BGR image using the LIME algorithm (GPU).
 
     Args:
         image:   Input float32 BGR 影像（線性空間，值可 > 1.0）。
@@ -114,29 +109,32 @@ def apply_lime(
     Returns:
         Enhanced float32 BGR 影像（線性空間）。
     """
-    S = image.astype(np.float32)
-    S_max = S.max()
-    if S_max < 1e-7:
-        return S.copy()
+    S_t = to_gpu(image)  # (H, W, 3)
+    S_max = S_t.max()
+    if S_max.item() < 1e-7:
+        return image.copy()
 
-    # 正規化至 [0, 1] 做照明估計
-    S_norm = S / S_max
+    S_norm = S_t / S_max
 
-    # --- Step 1: Initial illumination map --------------------------------
-    T_hat = _initial_illumination(S_norm)               # (H, W)
+    # --- Step 1: Initial illumination map T̂ = max_c(S) -------------------
+    T_hat = S_norm.max(dim=2).values  # (H, W)
 
-    # --- Step 2: Compute spatial weights ---------------------------------
-    W_h, W_v = _gradient_weights(T_hat, epsilon)
+    # --- Step 2: Gradient weights -----------------------------------------
+    dh = torch.zeros_like(T_hat)
+    dh[:, :-1] = T_hat[:, 1:] - T_hat[:, :-1]
+    dv = torch.zeros_like(T_hat)
+    dv[:-1, :] = T_hat[1:, :] - T_hat[:-1, :]
+    W_h = 1.0 / (torch.abs(dh) + epsilon)
+    W_v = 1.0 / (torch.abs(dv) + epsilon)
 
-    # --- Step 3: Refine illumination map ---------------------------------
-    T = _refine_illumination(T_hat, W_h, W_v, alpha)   # (H, W)
+    # --- Step 3: Refine illumination via CG on GPU ------------------------
+    T = _cg_solve(T_hat, W_h, W_v, alpha)
+    T = torch.clamp(T, 0.0, 1.0)
 
-    # --- Step 4: Gamma correction ----------------------------------------
-    T_gamma = np.power(T, gamma)                        # (H, W)
+    # --- Step 4: Gamma correction -----------------------------------------
+    T_gamma = torch.pow(T, gamma).unsqueeze(2)  # (H, W, 1)
 
-    # --- Step 5: Enhance each channel  R_c = S_c / T_γ ------------------
-    T_gamma_3ch = T_gamma[:, :, np.newaxis]             # (H, W, 1)
-    enhanced = S_norm / (T_gamma_3ch + 1e-7)
-
-    # 還原回原始 HDR 範圍
-    return (enhanced * S_max).astype(np.float32)
+    # --- Step 5: Enhance each channel  R_c = S_c / T_γ -------------------
+    enhanced = S_norm / (T_gamma + 1e-7)
+    result = enhanced * S_max
+    return to_cpu(result)

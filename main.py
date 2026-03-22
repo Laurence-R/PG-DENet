@@ -28,8 +28,9 @@ from pg_denet import (
 from pg_denet.pipeline import process_one_image, build_combined_avg
 
 # ── Configuration ────────────────────────────────────────────────────────────
-HDR_DIR = Path("data/hdr")
+HDR_DIR = Path("data/sid/short")
 MAX_SIDE = 1024
+SAVE_SAMPLES = 5       # 儲存前 N 張影像的恢復結果
 
 TM_METHODS: OrderedDict[str, callable] = OrderedDict([
     ("Logarithmic", tone_map_logarithmic),
@@ -46,8 +47,8 @@ LLE_METHODS: OrderedDict[str, callable] = OrderedDict([
 
 
 def main() -> None:
-    hdr_images = hdr_loader(HDR_DIR)
-    print(f"Loaded {len(hdr_images)} HDR image(s) from {HDR_DIR}")
+    total = sum(1 for _ in HDR_DIR.glob("*.ARW"))
+    print(f"Found {total} HDR image(s) in {HDR_DIR}")
 
     # 按 TM 追蹤: {tm_name: {lle_name: {"perc": [...], "iq": [...]}}}
     per_tm_metrics: dict[str, dict[str, dict[str, list]]] = {
@@ -55,12 +56,15 @@ def main() -> None:
         for tm in TM_METHODS
     }
 
-    for path, hdr_linear in hdr_images:
+    for i, (path, hdr_linear) in enumerate(hdr_loader(HDR_DIR), 1):
+        print(f"\n[{i}/{total}]")
+        save_dir = Path("result/samples") if i <= SAVE_SAMPLES else None
         process_one_image(
             path, hdr_linear, per_tm_metrics,
             lle_methods=LLE_METHODS,
             tm_methods=TM_METHODS,
             max_side=MAX_SIDE,
+            save_dir=save_dir,
         )
 
     # 圖表儲存至 result/figurations/
