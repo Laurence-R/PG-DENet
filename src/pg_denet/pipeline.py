@@ -6,16 +6,13 @@ metrics across images / TM methods for chart generation.
 """
 
 from __future__ import annotations
-
 import gc
 from collections import OrderedDict
 from pathlib import Path
-
 import cv2
 import numpy as np
 from pg_denet.pre_processing import auto_expose, resize_max
 from pg_denet.detection import detect, build_pseudo_gt, compute_perception_metrics
-from pg_denet.metrics import compute_niqe, compute_eme, compute_brisque
 from pg_denet.utils import timed, print_table
 
 
@@ -87,42 +84,30 @@ def process_one_image(
         for name in tm_results:
             pm = compute_perception_metrics(detections[name], pseudo_gt)
             perc_data[name] = {
-                "mAP@0.75": pm["mAP@0.75"],
-                "mAP_small": pm["mAP_small"] if not np.isnan(pm["mAP_small"]) else 0.0,
+                "mAP@50-95": pm["mAP@50-95"],
+                "mAP_small": pm["mAP_small"],
                 "Conf Mean": pm["Conf Mean"],
+                "FPS": pm["FPS"],
+                "Inf Time (ms)": pm["Inf Time (ms)"],
             }
             perc_rows.append([
                 name,
                 str(detections[name]["num_detections"]),
-                f"{pm['mAP@0.75']:.4f}",
-                f"{pm['mAP_small']:.4f}" if not np.isnan(pm["mAP_small"]) else "N/A",
+                f"{pm['mAP@50-95']:.4f}",
+                f"{pm['mAP_small']:.4f}",
                 f"{pm['Conf Mean']:.4f}",
+                f"{pm['FPS']:.1f}",
+                f"{pm['Inf Time (ms)']:.1f}",
             ])
         print_table(
             f"Perception Metrics [{tm_name}]",
-            ["LLE Method", "#Det", "mAP@0.75", "mAP_small", "Conf Mean"],
+            ["LLE Method", "#Det", "mAP@50-95", "mAP_small", "Conf Mean", "FPS", "Inf Time(ms)"],
             perc_rows,
-        )
-
-        # ── Image Quality Metrics (No-Reference) ─────────────────────
-        iq_data: OrderedDict[str, dict[str, float]] = OrderedDict()
-        iq_rows: list[list[str]] = []
-        for name, img in tm_results.items():
-            niqe = compute_niqe(img)
-            eme = compute_eme(img)
-            brisque = compute_brisque(img)
-            iq_data[name] = {"NIQE": niqe, "EME": eme, "BRISQUE": brisque}
-            iq_rows.append([name, f"{niqe:.4f}", f"{eme:.4f}", f"{brisque:.4f}"])
-        print_table(
-            f"Image Quality Metrics [{tm_name}]",
-            ["LLE Method", "NIQE ↓", "EME ↑", "BRISQUE ↓"],
-            iq_rows,
         )
 
         # Accumulate metrics
         for lle_name in perc_data:
             per_tm_metrics[tm_name][lle_name]["perc"].append(perc_data[lle_name])
-            per_tm_metrics[tm_name][lle_name]["iq"].append(iq_data[lle_name])
 
         del tm_results, detections
         gc.collect()
@@ -150,9 +135,8 @@ def build_combined_avg(
     for lle_name in lle_names:
         merged: dict[str, list[float]] = {}
         for tm_name in tm_names:
-            for key in ("perc", "iq"):
-                for record in per_tm[tm_name][lle_name][key]:
-                    for m, v in record.items():
-                        merged.setdefault(m, []).append(v)
+            for record in per_tm[tm_name][lle_name]["perc"]:
+                for m, v in record.items():
+                    merged.setdefault(m, []).append(v)
         result[lle_name] = {m: float(np.mean(vals)) for m, vals in merged.items()}
     return result

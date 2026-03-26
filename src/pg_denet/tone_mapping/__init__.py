@@ -10,10 +10,8 @@ References:
 """
 
 import math
-
 import numpy as np
 import torch
-
 from pg_denet.gpu import to_gpu
 
 

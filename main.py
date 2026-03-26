@@ -5,8 +5,7 @@ Pipeline (see flowchart):
         → Pre-Processing (Convert to Linear Space)
         → LLE Methods (CLAHE, MSRCR, AGCWD, LIME)  — enhance in linear space
         → Tone Mapping (Logarithmic / Linear / Reinhard) → LDR
-        → YOLO11 → Perception Metrics  (mAP@0.75, mAP_small, Conf Mean)
-        → Image Quality Metrics          (NIQE, EME, BRISQUE)
+        → YOLO11 → Perception Metrics  (mAP@50-95, mAP_small, Conf Mean, FPS, Inf Time)
 
 結果按 TM 方法分類，每個 TM 資料夾內比較 4 種 LLE 方法。
 """
@@ -50,9 +49,9 @@ def main() -> None:
     total = sum(1 for _ in HDR_DIR.glob("*.ARW"))
     print(f"Found {total} HDR image(s) in {HDR_DIR}")
 
-    # 按 TM 追蹤: {tm_name: {lle_name: {"perc": [...], "iq": [...]}}}
+    # 按 TM 追蹤: {tm_name: {lle_name: {"perc": [...]}}}
     per_tm_metrics: dict[str, dict[str, dict[str, list]]] = {
-        tm: {lle: {"perc": [], "iq": []} for lle in LLE_METHODS}
+        tm: {lle: {"perc": []} for lle in LLE_METHODS}
         for tm in TM_METHODS
     }
 
@@ -69,14 +68,14 @@ def main() -> None:
 
     # 圖表儲存至 result/figurations/
     fig_dir = Path("result/figurations")
-    lower_ib = {"NIQE", "BRISQUE"}
+    lower_ib = {"Inf Time (ms)"}
     lle_names = list(LLE_METHODS.keys())
 
     for tm_name in TM_METHODS:
         avg_data = build_combined_avg(per_tm_metrics, [tm_name], lle_names)
         save_chart(
             avg_data,
-            f"Avg 6-Metric — {tm_name} (all images)",
+            f"Avg Perception Metrics — {tm_name} (all images)",
             fig_dir / f"{tm_name}_avg.png",
             lower_is_better=lower_ib,
         )
@@ -85,7 +84,7 @@ def main() -> None:
     all_avg = build_combined_avg(per_tm_metrics, list(TM_METHODS.keys()), lle_names)
     save_chart(
         all_avg,
-        "Avg 6-Metric — All TM × All Images",
+        "Avg Perception Metrics — All TM × All Images",
         fig_dir / "avg_all.png",
         lower_is_better=lower_ib,
     )

@@ -3,10 +3,12 @@
 Provides:
     - ``detect``                  — run YOLO inference on a single image
     - ``build_pseudo_gt``         — aggregate detections from multiple methods via NMS
-    - ``compute_perception_metrics`` — mAP\@0.75, mAP_small, Confidence Mean
+    - ``compute_perception_metrics`` — mAP@50-95, mAP_small, Conf Mean, FPS, Inf Time
 """
 
 from __future__ import annotations
+
+import time
 
 import numpy as np
 from ultralytics import YOLO
@@ -32,10 +34,13 @@ def detect(
     """Run YOLO object detection on a BGR uint8 image.
 
     Returns:
-        dict with keys *boxes*, *num_detections*, *confidence_mean*, *annotated*.
+        dict with keys *boxes*, *num_detections*, *confidence_mean*,
+        *fps*, *inf_time_ms*, *annotated*.
     """
     model = _get_model(model_name)
+    t0 = time.perf_counter()
     results = model(image, conf=conf, verbose=False)
+    elapsed = time.perf_counter() - t0
 
     boxes: list[dict] = []
     for r in results:
@@ -59,6 +64,8 @@ def detect(
         "boxes": boxes,
         "num_detections": len(boxes),
         "confidence_mean": float(np.mean(confs)) if confs else 0.0,
+        "fps": 1.0 / elapsed,
+        "inf_time_ms": elapsed * 1000.0,
         "annotated": results[0].plot() if results else image.copy(),
     }
 
@@ -184,6 +191,7 @@ def _compute_ap(
 # ── Public: perception metrics ────────────────────────────────────────────────
 
 SMALL_AREA_THRESHOLD = 32 * 32  # COCO definition
+_IOU_THRESHOLDS = np.arange(0.50, 1.00, 0.05)  # [0.50, 0.55, ..., 0.95]
 
 
 def compute_perception_metrics(
@@ -193,20 +201,32 @@ def compute_perception_metrics(
     """Compute perception metrics for one method's detections vs pseudo-GT.
 
     Returns:
-        dict with keys ``mAP@0.75``, ``mAP_small``, ``Conf Mean``.
+        dict with keys ``mAP@50-95``, ``mAP_small``, ``Conf Mean``,
+        ``FPS``, ``Inf Time (ms)``.
     """
     pred = [
         {"bbox": b["bbox"], "confidence": b["confidence"], "class_id": b["class_id"]}
         for b in method_det["boxes"]
     ]
 
-    map_75 = _compute_ap(pred, pseudo_gt, iou_threshold=0.75)
+    # mAP@50-95: average over IoU thresholds [0.50, 0.55, ..., 0.95]
+    map_5095 = float(np.mean([
+        _compute_ap(pred, pseudo_gt, iou_threshold=t) for t in _IOU_THRESHOLDS
+    ]))
 
+    # mAP_small@50-95: same but only for small boxes (area < 32×32)
     small_gt = [g for g in pseudo_gt if g["area"] < SMALL_AREA_THRESHOLD]
-    map_small = _compute_ap(pred, small_gt, iou_threshold=0.5) if small_gt else float("nan")
+    if small_gt:
+        map_small = float(np.mean([
+            _compute_ap(pred, small_gt, iou_threshold=t) for t in _IOU_THRESHOLDS
+        ]))
+    else:
+        map_small = 0.0
 
     return {
-        "mAP@0.75": map_75,
+        "mAP@50-95": map_5095,
         "mAP_small": map_small,
         "Conf Mean": method_det["confidence_mean"],
+        "FPS": method_det["fps"],
+        "Inf Time (ms)": method_det["inf_time_ms"],
     }
