@@ -1,13 +1,9 @@
-"""PG-DENet — 1st Stage Pipeline (Ver. 2)
+"""PG-DENet — 1st Stage Pipeline
 
-Pipeline (see flowchart):
-    HDR Image (SID)
-        → Pre-Processing (Convert to Linear Space)
-        → LLE Methods (CLAHE, MSRCR, AGCWD, LIME)  — enhance in linear space
-        → Tone Mapping (Logarithmic / Linear / Reinhard) → LDR
-        → YOLO11 → Perception Metrics  (mAP@50-95, mAP_small, Conf Mean, FPS, Inf Time)
+Pipeline:
+    HDR Image (SID) → Pre-Processing → LLE → Tone Mapping → YOLO → Metrics
 
-結果按 TM 方法分類，每個 TM 資料夾內比較 4 種 LLE 方法。
+Each YOLO model produces a full set of charts under result/figurations/{model}/.
 """
 
 from collections import OrderedDict
@@ -22,14 +18,16 @@ from pg_denet import (
     tone_map_logarithmic,
     tone_map_linear,
     tone_map_reinhard,
-    save_chart,
 )
-from pg_denet.pipeline import process_one_image, build_combined_avg
+from pg_denet.pipeline import process_one_image, make_accumulators
+from pg_denet.charts import generate_all_charts
 
 # ── Configuration ────────────────────────────────────────────────────────────
 HDR_DIR = Path("data/sid/short")
 MAX_SIDE = 1024
 SAVE_SAMPLES = 5       # 儲存前 N 張影像的恢復結果
+
+MODELS = ["yolo11l.pt", "yolo26l.pt"]
 
 TM_METHODS: OrderedDict[str, callable] = OrderedDict([
     ("Logarithmic", tone_map_logarithmic),
@@ -45,50 +43,41 @@ LLE_METHODS: OrderedDict[str, callable] = OrderedDict([
 ])
 
 
-def main() -> None:
-    total = sum(1 for _ in HDR_DIR.glob("*.ARW"))
-    print(f"Found {total} HDR image(s) in {HDR_DIR}")
+def run_for_model(model_name: str, total: int) -> None:
+    """Run full pipeline and generate charts for a single YOLO model."""
+    label = model_name.replace(".pt", "")
+    fig_dir = Path("result/figurations") / label
+    lle_names = list(LLE_METHODS.keys())
+    tm_names = list(TM_METHODS.keys())
 
-    # 按 TM 追蹤: {tm_name: {lle_name: {"perc": [...]}}}
-    per_tm_metrics: dict[str, dict[str, dict[str, list]]] = {
-        tm: {lle: {"perc": []} for lle in LLE_METHODS}
-        for tm in TM_METHODS
-    }
+    per_tm_data, lle_timings = make_accumulators(tm_names, lle_names)
 
     for i, (path, hdr_linear) in enumerate(hdr_loader(HDR_DIR), 1):
         print(f"\n[{i}/{total}]")
         save_dir = Path("result/samples") if i <= SAVE_SAMPLES else None
         process_one_image(
-            path, hdr_linear, per_tm_metrics,
+            path, hdr_linear, per_tm_data, lle_timings,
             lle_methods=LLE_METHODS,
             tm_methods=TM_METHODS,
             max_side=MAX_SIDE,
             save_dir=save_dir,
+            model_name=model_name,
         )
 
-    # 圖表儲存至 result/figurations/
-    fig_dir = Path("result/figurations")
-    lower_ib = {"Inf Time (ms)"}
-    lle_names = list(LLE_METHODS.keys())
+    print(f"\n[Charts — {label}]")
+    generate_all_charts(label, fig_dir, per_tm_data, lle_timings, lle_names, tm_names)
 
-    for tm_name in TM_METHODS:
-        avg_data = build_combined_avg(per_tm_metrics, [tm_name], lle_names)
-        save_chart(
-            avg_data,
-            f"Avg Perception Metrics — {tm_name} (all images)",
-            fig_dir / f"{tm_name}_avg.png",
-            lower_is_better=lower_ib,
-        )
-        print(f"  ✓ result/figurations/{tm_name}_avg.png")
 
-    all_avg = build_combined_avg(per_tm_metrics, list(TM_METHODS.keys()), lle_names)
-    save_chart(
-        all_avg,
-        "Avg Perception Metrics — All TM × All Images",
-        fig_dir / "avg_all.png",
-        lower_is_better=lower_ib,
-    )
-    print("  ✓ result/figurations/avg_all.png")
+def main() -> None:
+    total = sum(1 for _ in HDR_DIR.glob("*.ARW"))
+    print(f"Found {total} HDR image(s) in {HDR_DIR}")
+
+    for model_name in MODELS:
+        label = model_name.replace(".pt", "")
+        print(f"\n{'=' * 64}")
+        print(f"  Model: {label}")
+        print(f"{'=' * 64}")
+        run_for_model(model_name, total)
 
     print("\n" + "=" * 64)
     print("  Pipeline complete — all results saved to result/")

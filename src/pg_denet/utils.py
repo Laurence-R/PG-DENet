@@ -12,6 +12,15 @@ def timed(name: str, fn, *args, **kwargs):
     return result
 
 
+def timed_ms(name: str, fn, *args, **kwargs):
+    """Execute *fn*, print elapsed time, return ``(result, elapsed_ms)``."""
+    t0 = time.perf_counter()
+    result = fn(*args, **kwargs)
+    ms = (time.perf_counter() - t0) * 1000
+    print(f"  {name:<20s} {ms:8.1f} ms")
+    return result, ms
+
+
 def print_table(title: str, headers: list[str], rows: list[list[str]]) -> None:
     """Pretty-print a table to the terminal."""
     col_w = [max(len(h), *(len(r[i]) for r in rows)) + 2 for i, h in enumerate(headers)]
