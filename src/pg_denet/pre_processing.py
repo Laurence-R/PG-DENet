@@ -11,6 +11,11 @@ import torch
 from pg_denet.gpu import luminance_gpu, to_gpu, to_cpu
 
 
+def linear_to_uint8(img: np.ndarray) -> np.ndarray:
+    """Naively convert linear float32 [0,1+] to uint8 by clipping."""
+    return np.clip(img * 255.0, 0, 255).astype(np.uint8)
+
+
 def auto_expose(linear_bgr: np.ndarray, key: float = 0.18) -> np.ndarray:
     """Reinhard-style auto-exposure: maps log-average luminance to *key* value.
 

@@ -1,87 +1,143 @@
 """PG-DENet — 1st Stage Pipeline
 
-Pipeline:
-    HDR Image (SID) → Pre-Processing → LLE → Tone Mapping → YOLO → Metrics
+Compares two approaches:
+  A) RAW baseline: rawpy linear output → clip & scale to uint8 → YOLO
+  B) Enhanced:     rawpy linear → auto_expose → CLAHE → Log TM → YOLO
 
-Each YOLO model produces a full set of charts under result/figurations/{model}/.
+Only first 20 images from SID/short.
 """
 
-from collections import OrderedDict
 from pathlib import Path
+from time import perf_counter
 
-from pg_denet import (
-    hdr_loader,
-    apply_clahe,
-    apply_lime,
-    apply_agcwd,
-    apply_msrcr,
-    tone_map_logarithmic,
-    tone_map_linear,
-    tone_map_reinhard,
-)
-from pg_denet.pipeline import process_one_image, make_accumulators
-from pg_denet.charts import generate_all_charts
+import numpy as np
+import torch
+
+from pg_denet.io import hdr_loader, save_batch
+from pg_denet.pre_processing import auto_expose, resize_max, linear_to_uint8
+from pg_denet.lle_methods.clahe import apply_clahe
+from pg_denet.tone_mapping import tone_map_logarithmic
+from pg_denet.detection import warmup_model, run_batch_detection
+from pg_denet.visualization import save_chart
 
 # ── Configuration ────────────────────────────────────────────────────────────
 HDR_DIR = Path("data/sid/short")
+MODEL = "yolo26l.engine"
+MAX_IMAGES = 20
 MAX_SIDE = 1024
-SAVE_SAMPLES = 5       # 儲存前 N 張影像的恢復結果
+GT_CONF = 0.7
+DET_CONF = 0.25
 
-MODELS = ["yolo11l.pt", "yolo26l.pt"]
-
-TM_METHODS: OrderedDict[str, callable] = OrderedDict([
-    ("Logarithmic", tone_map_logarithmic),
-    ("Linear",      tone_map_linear),
-    ("Reinhard",    tone_map_reinhard),
-])
-
-LLE_METHODS: OrderedDict[str, callable] = OrderedDict([
-    ("CLAHE", apply_clahe),
-    ("MSRCR", apply_msrcr),
-    ("AGCWD", apply_agcwd),
-    ("LIME",  apply_lime),
-])
-
-
-def run_for_model(model_name: str, total: int) -> None:
-    """Run full pipeline and generate charts for a single YOLO model."""
-    label = model_name.replace(".pt", "")
-    fig_dir = Path("result/figurations") / label
-    lle_names = list(LLE_METHODS.keys())
-    tm_names = list(TM_METHODS.keys())
-
-    per_tm_data, lle_timings = make_accumulators(tm_names, lle_names)
-
-    for i, (path, hdr_linear) in enumerate(hdr_loader(HDR_DIR), 1):
-        print(f"\n[{i}/{total}]")
-        save_dir = Path("result/samples") if i <= SAVE_SAMPLES else None
-        process_one_image(
-            path, hdr_linear, per_tm_data, lle_timings,
-            lle_methods=LLE_METHODS,
-            tm_methods=TM_METHODS,
-            max_side=MAX_SIDE,
-            save_dir=save_dir,
-            model_name=model_name,
-        )
-
-    print(f"\n[Charts — {label}]")
-    generate_all_charts(label, fig_dir, per_tm_data, lle_timings, lle_names, tm_names)
+METRIC_KEYS = ["mAP@50-95", "Conf Mean", "Inference Time (ms)", "E2E Time (ms)", "FPS"]
 
 
 def main() -> None:
-    total = sum(1 for _ in HDR_DIR.glob("*.ARW"))
-    print(f"Found {total} HDR image(s) in {HDR_DIR}")
+    total = min(MAX_IMAGES, sum(1 for _ in HDR_DIR.glob("*.ARW")))
+    print(f"Model: {MODEL}  |  Images: {total}  |  GT conf >= {GT_CONF}")
+    print("=" * 70)
 
-    for model_name in MODELS:
-        label = model_name.replace(".pt", "")
-        print(f"\n{'=' * 64}")
-        print(f"  Model: {label}")
-        print(f"{'=' * 64}")
-        run_for_model(model_name, total)
+    # ── Phase 0: Load & Resize (CPU only) ─────────────────────────────────
+    print("\n[Phase 0] Loading RAW images and resizing")
+    raw_images: list[tuple[Path, np.ndarray]] = []
+    for i, (path, hdr) in enumerate(hdr_loader(HDR_DIR), 1):
+        if i > MAX_IMAGES:
+            break
+        hdr = resize_max(hdr, MAX_SIDE)
+        raw_images.append((path, hdr))
+        print(f"  [{i:>2}/{total}] {path.name}  →  {hdr.shape[1]}×{hdr.shape[0]}")
 
-    print("\n" + "=" * 64)
-    print("  Pipeline complete — all results saved to result/")
-    print("=" * 64)
+    # ── Phase 1A: RAW baseline (no enhancement) ──────────────────────────
+    print("\n[Phase 1A] RAW Baseline: linear → clip to uint8")
+    raw_ldr: list[tuple[Path, np.ndarray]] = []
+    raw_preproc_ms: list[float] = []
+    for path, hdr in raw_images:
+        t0 = perf_counter()
+        ldr = linear_to_uint8(hdr)
+        pp_ms = (perf_counter() - t0) * 1000
+        raw_preproc_ms.append(pp_ms)
+        raw_ldr.append((path, ldr))
+        print(f"  [{i:>2}/{total}] {path.name}  ({pp_ms:.1f}ms)")
+
+    # ── Phase 1B: Enhanced pipeline (GPU) ─────────────────────────────────
+    print("[Phase 1B] Enhanced: auto_expose → CLAHE → Logarithmic TM")
+    _ = auto_expose(raw_images[0][1], key=0.18)
+    torch.cuda.synchronize()
+
+    enh_ldr: list[tuple[Path, np.ndarray]] = []
+    preproc_ms: list[float] = []
+
+    for i, (path, hdr) in enumerate(raw_images, 1):
+        torch.cuda.synchronize()
+        t0 = perf_counter()
+        exposed = auto_expose(hdr, key=0.18)
+        enhanced = apply_clahe(exposed)
+        ldr = tone_map_logarithmic(enhanced)
+        torch.cuda.synchronize()
+        pp_ms = (perf_counter() - t0) * 1000
+        preproc_ms.append(pp_ms)
+        enh_ldr.append((path, ldr))
+        print(f"  [{i:>2}/{total}] {path.name}  ({pp_ms:.1f}ms)")
+
+    del raw_images
+
+    # Save images for both pipelines
+    raw_dir = Path("result/samples/raw_baseline")
+    enh_dir = Path("result/samples/enhanced")
+    save_batch(raw_ldr, raw_dir)
+    save_batch(enh_ldr, enh_dir)
+    print(f"  Saved RAW baseline → {raw_dir}/")
+    print(f"  Saved Enhanced     → {enh_dir}/")
+
+    # Release PyTorch GPU cache before TensorRT
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+
+    # ── Phase 2: YOLO Detection ───────────────────────────────────────────
+    print(f"\n[Phase 2] YOLO Detection: {MODEL}")
+    warmup_model(MODEL)
+
+    print("\n--- A) RAW Baseline ---")
+    raw_metrics = run_batch_detection(
+        raw_ldr, MODEL, Path("result/samples/raw_baseline_det"),
+        raw_preproc_ms, conf=DET_CONF, gt_conf=GT_CONF, label="RAW",
+    )
+
+    print("\n--- B) Enhanced (CLAHE + Log TM) ---")
+    enh_metrics = run_batch_detection(
+        enh_ldr, MODEL, Path("result/samples/enhanced_det"),
+        preproc_ms, conf=DET_CONF, gt_conf=GT_CONF, label="ENH",
+    )
+
+    # ── Summary ───────────────────────────────────────────────────────────
+    raw_avg = {k: float(np.mean([m[k] for m in raw_metrics])) for k in METRIC_KEYS}
+    enh_avg = {k: float(np.mean([m[k] for m in enh_metrics])) for k in METRIC_KEYS}
+
+    print(f"\n{'=' * 70}")
+    print(f"  Comparison  ({MODEL}, {total} images)")
+    print(f"{'=' * 70}")
+    print(f"  {'Metric':<25s} {'RAW':>10s} {'Enhanced':>10s} {'Δ':>10s}")
+    print(f"  {'-'*25} {'-'*10} {'-'*10} {'-'*10}")
+    for k in METRIC_KEYS:
+        r, e = raw_avg[k], enh_avg[k]
+        delta = e - r
+        fmt = ".1f" if "ms" in k or k == "FPS" else ".4f"
+        sign = "+" if delta > 0 else ""
+        print(f"  {k:<25s} {r:>10{fmt}} {e:>10{fmt}} {sign}{delta:>9{fmt}}")
+    print(f"{'=' * 70}")
+
+    # ── Chart ─────────────────────────────────────────────────────────────
+    chart_data = {
+        "RAW Baseline": raw_avg,
+        "CLAHE + Log TM": enh_avg,
+    }
+    fig_path = Path("result/figurations/1st_stage_result.png")
+    save_chart(
+        chart_data,
+        f"RAW vs Enhanced — {MODEL}",
+        fig_path,
+        lower_is_better={"Inference Time (ms)", "E2E Time (ms)"},
+    )
+    print(f"\n  Chart saved: {fig_path}")
 
 
 if __name__ == "__main__":

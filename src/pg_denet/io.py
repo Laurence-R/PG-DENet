@@ -5,16 +5,6 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-def load_images(directory: Path) -> list[tuple[Path, np.ndarray]]:
-    """從目錄遞迴載入所有 PNG/JPG 圖片。
-
-    Returns:
-        List of (file_path, image) tuples.
-    """
-    files = list(directory.rglob("*.[pj][np]g"))
-    return [(file, cv2.imread(str(file))) for file in files]
-
-
 def hdr_loader(directory: Path) -> Iterator[tuple[Path, np.ndarray]]:
     """逐張載入目錄內所有 ARW (Sony RAW) 影像，轉為 Linear Space float32。
 
@@ -36,4 +26,14 @@ def hdr_loader(directory: Path) -> Iterator[tuple[Path, np.ndarray]]:
         linear = rgb.astype(np.float32) / 65535.0
         bgr = cv2.cvtColor(linear, cv2.COLOR_RGB2BGR)
         yield f, bgr
+
+
+def save_batch(
+    images: list[tuple[Path, np.ndarray]],
+    out_dir: Path,
+) -> None:
+    """將 (path, image) 列表批次儲存至指定目錄。"""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for path, img in images:
+        cv2.imwrite(str(out_dir / f"{path.stem}.png"), img)
 

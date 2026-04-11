@@ -1,7 +1,7 @@
 [project]
 name = "pg-denet"
 version = "0.1.0"
-description = "Add your description here"
+description = "Physics-Guided Daytime-like Enhancement Network for low-light object detection"
 readme = "README.md"
 authors = [
     { name = "Laurence-R", email = "sdjoid@gmail.com" }
@@ -9,7 +9,10 @@ authors = [
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=2.2.6",
+    "opencv-python>=4.13.0",
+    "matplotlib>=3.10.0",
     "rawpy>=0.26.1",
+    "torch>=2.10.0",
     "ultralytics>=8.4.21",
 ]
 
