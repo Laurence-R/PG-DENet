@@ -129,7 +129,7 @@ def _compute_ap(
     iou_threshold: float = 0.75,
 ) -> float:
     if not gt_list:
-        return 1.0 if not pred_boxes else 0.0
+        return 0.0
     if not pred_boxes:
         return 0.0
 
@@ -202,8 +202,8 @@ def compute_metrics(det_result: dict, gt_conf: float = 0.7) -> dict[str, float]:
     return {
         "mAP@50-95": map_5095,
         "Conf Mean": det_result["confidence_mean"],
-        "Inference Time (ms)": det_result["inference_ms"],
-        "FPS": det_result["fps"],
+        "YOLO Inference Time (ms)": det_result["inference_ms"],
+        "YOLO FPS": det_result["fps"],
     }
 
 
@@ -240,7 +240,7 @@ def run_batch_detection(
     for i, (path, img) in enumerate(images, 1):
         det = detect(img, model_name, conf=conf)
         m = compute_metrics(det, gt_conf=gt_conf)
-        m["E2E Time (ms)"] = preproc_ms[i - 1] + m["Inference Time (ms)"]
+        m["E2E Time (ms)"] = preproc_ms[i - 1] + m["YOLO Inference Time (ms)"]
         metrics_list.append(m)
         cv2.imwrite(str(det_dir / f"{path.stem}.png"), det["annotated"])
         print(

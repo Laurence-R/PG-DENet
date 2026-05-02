@@ -14,6 +14,7 @@ import numpy as np
 import torch
 
 from pg_denet.io import hdr_loader, save_batch
+from pg_denet.halo_suppress import highlight_suppress
 from pg_denet.pre_processing import auto_expose, resize_max, linear_to_uint8
 from pg_denet.lle_methods.clahe import apply_clahe
 from pg_denet.tone_mapping import tone_map_logarithmic
@@ -22,13 +23,13 @@ from pg_denet.visualization import save_chart
 
 # ── Configuration ────────────────────────────────────────────────────────────
 HDR_DIR = Path("data/sid/short")
-MODEL = "yolo26l.engine"
+MODEL = "yolo26s.engine"
 MAX_IMAGES = 20
 MAX_SIDE = 1024
 GT_CONF = 0.7
 DET_CONF = 0.25
 
-METRIC_KEYS = ["mAP@50-95", "Conf Mean", "Inference Time (ms)", "E2E Time (ms)", "FPS"]
+METRIC_KEYS = ["mAP@50-95", "Conf Mean", "YOLO Inference Time (ms)", "E2E Time (ms)", "YOLO FPS"]
 
 
 def main() -> None:
@@ -59,7 +60,7 @@ def main() -> None:
         print(f"  [{i:>2}/{total}] {path.name}  ({pp_ms:.1f}ms)")
 
     # ── Phase 1B: Enhanced pipeline (GPU) ─────────────────────────────────
-    print("[Phase 1B] Enhanced: auto_expose → CLAHE → Logarithmic TM")
+    print("[Phase 1B] Enhanced: auto_expose → Guided Filter → CLAHE → Logarithmic TM")
     _ = auto_expose(raw_images[0][1], key=0.18)
     torch.cuda.synchronize()
 
@@ -69,8 +70,11 @@ def main() -> None:
     for i, (path, hdr) in enumerate(raw_images, 1):
         torch.cuda.synchronize()
         t0 = perf_counter()
-        exposed = auto_expose(hdr, key=0.18)
+        # exposed = auto_expose(hdr, key=0.18)
+        exposed = hdr
         enhanced = apply_clahe(exposed)
+        # suppressed = highlight_suppress(enhanced)
+        # enhanced = apply_clahe(suppressed)
         ldr = tone_map_logarithmic(enhanced)
         torch.cuda.synchronize()
         pp_ms = (perf_counter() - t0) * 1000
@@ -127,8 +131,8 @@ def main() -> None:
 
     # ── Chart ─────────────────────────────────────────────────────────────
     chart_data = {
-        "RAW Baseline": raw_avg,
-        "CLAHE + Log TM": enh_avg,
+        "RAW → YOLO": raw_avg,
+        "CLAHE + LogTM → YOLO": enh_avg,
     }
     fig_path = Path("result/figurations/1st_stage_result.png")
     save_chart(
